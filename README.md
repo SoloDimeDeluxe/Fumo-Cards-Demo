@@ -78,15 +78,13 @@ No other file needs to change (a brand-new modifier type only needs a rule in `M
 
 ## Running it
 
-**Manually in Studio:** recreate the `src` structure and paste each file's contents. The file suffix tells you the script type:
+Recreate the `src` structure in Studio and paste each file's contents. The file suffix tells you the script type:
 
 | File | Studio object | Goes in |
 |---|---|---|
 | `*.server.lua` | Script | `src/server` → ServerScriptService, `src/character` → StarterPlayer › StarterCharacterScripts |
 | `*.client.lua` | LocalScript | `src/client` → StarterPlayer › StarterPlayerScripts |
 | `*.lua` | ModuleScript | same folder as above (e.g. `CardSystem/Cards`) |
-
-**With Rojo (optional):** a `default.project.json` is included, so `rojo serve` + "Connect" in the Rojo Studio plugin syncs everything automatically.
 
 The test map lives in the place file (not in this repo). It needs, in `Workspace`:
 

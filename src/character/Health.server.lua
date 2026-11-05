@@ -1,0 +1,3 @@
+-- Intentionally empty.
+-- A Script named "Health" in StarterCharacterScripts replaces Roblox's default
+-- health regeneration, so StatsService can handle regen with card modifiers.

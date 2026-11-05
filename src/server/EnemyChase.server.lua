@@ -1,12 +1,14 @@
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local PathfindingService = game:GetService("PathfindingService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local ENEMY_FOLDER = workspace:WaitForChild("Enemies")
 local CHASE_SPEED = 12
 local DETECTION_RANGE = 80
 local PATH_REFRESH_TIME = 0.5       -- seconds between path recalculations
 local WAYPOINT_REACHED_DISTANCE = 3 -- how close counts as "arrived" at a waypoint
+local WALL_BACKOFF_DISTANCE = 4     -- how far from the wall to retry the path when stuck against it
 local DEBUG_PATHS = false           -- true = print path info and draw waypoints
 
 -- Size of the agent the path is computed for (our cubes are 4x4x4)
@@ -18,6 +20,37 @@ local AGENT_PARAMS = {
 
 -- [enemy] = { waypoints = {...}, index = number }
 local enemyPaths = {}
+
+---------------------------------------------------------------------
+-- Aggressive mode toggle (demo only): killers stay idle until it's turned on.
+-- Stored as a Workspace attribute so KillerDamage can read it too.
+---------------------------------------------------------------------
+
+local START_AGGRESSIVE = false
+workspace:SetAttribute("KillersActive", START_AGGRESSIVE)
+
+local function getOrCreate(parent, className, name)
+	local instance = parent:FindFirstChild(name)
+	if not instance then
+		instance = Instance.new(className)
+		instance.Name = name
+		instance.Parent = parent
+	end
+	return instance
+end
+
+local remotesFolder = getOrCreate(ReplicatedStorage, "Folder", "GameplayRemotes")
+local toggleKillersEvent = getOrCreate(remotesFolder, "RemoteEvent", "ToggleKillers")
+
+toggleKillersEvent.OnServerEvent:Connect(function(player)
+	local isActive = not workspace:GetAttribute("KillersActive")
+	workspace:SetAttribute("KillersActive", isActive)
+	print(player.Name, "set killers aggressive mode:", isActive)
+end)
+
+local function areKillersActive()
+	return workspace:GetAttribute("KillersActive") == true
+end
 
 local function getClosestCharacterRoot(position)
 	local closestRoot, closestDistance = nil, DETECTION_RANGE
@@ -35,14 +68,38 @@ local function getClosestCharacterRoot(position)
 	return closestRoot
 end
 
--- True if nothing (except enemies and the target itself) blocks the straight line
-local function hasLineOfSight(enemy, targetRoot)
+-- Raycast that ignores enemies and the target's character
+local function castIgnoringActors(origin, goal, targetRoot)
 	local raycastParams = RaycastParams.new()
 	raycastParams.FilterType = Enum.RaycastFilterType.Exclude
 	raycastParams.FilterDescendantsInstances = { ENEMY_FOLDER, targetRoot.Parent }
+	return workspace:Raycast(origin, goal - origin, raycastParams)
+end
 
-	local direction = targetRoot.Position - enemy.Position
-	return workspace:Raycast(enemy.Position, direction, raycastParams) == nil
+-- Moves a point a few studs away from the wall it's touching (along the wall's normal)
+local function backOffFromWall(position, hit)
+	local flatNormal = Vector3.new(hit.Normal.X, 0, hit.Normal.Z)
+	if flatNormal.Magnitude < 0.01 then
+		return position
+	end
+	return position + flatNormal.Unit * WALL_BACKOFF_DISTANCE
+end
+
+-- Returns the path's waypoints, or nil if no path was found
+local function computeWaypoints(startPosition, targetPosition)
+	local path = PathfindingService:CreatePath(AGENT_PARAMS)
+	local success, errorMessage = pcall(function()
+		path:ComputeAsync(startPosition, targetPosition)
+	end)
+
+	if DEBUG_PATHS then
+		print("path | pcall:", success, errorMessage, "| status:", path.Status)
+	end
+
+	if success and path.Status == Enum.PathStatus.Success then
+		return path:GetWaypoints()
+	end
+	return nil
 end
 
 -- Server owns enemy physics so the knockback isn't overridden by a client
@@ -50,6 +107,14 @@ local function setupEnemy(enemy)
 	if not enemy:IsA("BasePart") then return end
 	enemy.Anchored = false
 	enemy:SetNetworkOwner(nil)
+
+	-- Lets paths go through enemy cubes, so an enemy isn't blocked by itself
+	-- or by the other cubes crowding around it
+	if not enemy:FindFirstChildOfClass("PathfindingModifier") then
+		local modifier = Instance.new("PathfindingModifier")
+		modifier.PassThrough = true
+		modifier.Parent = enemy
+	end
 end
 
 for _, enemy in ENEMY_FOLDER:GetChildren() do
@@ -87,6 +152,13 @@ task.spawn(function()
 			debugFolder:ClearAllChildren()
 		end
 
+		-- Idle killers don't need paths
+		if not areKillersActive() then
+			table.clear(enemyPaths)
+			task.wait(PATH_REFRESH_TIME)
+			continue
+		end
+
 		for _, enemy in ENEMY_FOLDER:GetChildren() do
 			if not enemy:IsA("BasePart") then continue end
 
@@ -97,30 +169,47 @@ task.spawn(function()
 			end
 
 			-- Clear view: go straight, no path needed
-			if hasLineOfSight(enemy, target) then
+			local hitFromEnemy = castIgnoringActors(enemy.Position, target.Position, target)
+			if not hitFromEnemy then
 				enemyPaths[enemy] = nil
 				continue
 			end
 
-			local path = PathfindingService:CreatePath(AGENT_PARAMS)
-			local success, errorMessage = pcall(function()
-				path:ComputeAsync(enemy.Position, target.Position)
-			end)
+			-- If the enemy or the player is pressed against the wall, pathfinding thinks
+			-- that point is "inside" the wall and fails. So we also prepare versions of
+			-- both points moved a few studs away from the wall.
+			local hitFromTarget = castIgnoringActors(target.Position, enemy.Position, target)
+			local backedOffStart = backOffFromWall(enemy.Position, hitFromEnemy)
+			local backedOffTarget = if hitFromTarget
+				then backOffFromWall(target.Position, hitFromTarget)
+				else target.Position
 
-			if DEBUG_PATHS then
-				print(enemy.Name, "-> blocked view | pcall:", success, errorMessage, "| status:", path.Status)
+			-- Try the exact points first, then the backed-off ones.
+			-- startIndex 1 = walk to the backed-off start first; 2 = skip it (it's where we are)
+			local attempts = {
+				{ enemy.Position, target.Position, 2 },
+				{ backedOffStart, target.Position, 1 },
+				{ enemy.Position, backedOffTarget, 2 },
+				{ backedOffStart, backedOffTarget, 1 },
+			}
+
+			local waypoints, startIndex = nil, 2
+			for _, attempt in attempts do
+				waypoints = computeWaypoints(attempt[1], attempt[2])
+				if waypoints then
+					startIndex = attempt[3]
+					break
+				end
 			end
 
 			-- The enemy may have been destroyed while the path was computing
-			if enemy.Parent and success and path.Status == Enum.PathStatus.Success then
-				local waypoints = path:GetWaypoints()
-				-- Index 1 is the start position, so we begin at 2
-				enemyPaths[enemy] = { waypoints = waypoints, index = 2 }
+			if enemy.Parent and waypoints then
+				enemyPaths[enemy] = { waypoints = waypoints, index = startIndex }
 				if DEBUG_PATHS then
 					drawPath(waypoints)
 				end
 			end
-			-- If the path fails we keep the previous one instead of clearing it,
+			-- If both attempts fail we keep the previous path instead of clearing it,
 			-- so the enemy doesn't fall back to walking straight into the wall
 		end
 
@@ -138,8 +227,9 @@ RunService.Heartbeat:Connect(function()
 		if os.clock() < stunnedUntil then continue end
 
 		local currentVelocity = enemy.AssemblyLinearVelocity
-		local target = getClosestCharacterRoot(enemy.Position)
+		local target = if areKillersActive() then getClosestCharacterRoot(enemy.Position) else nil
 
+		-- No target (or aggressive mode off): stand still
 		if not target then
 			enemy.AssemblyLinearVelocity = Vector3.new(0, currentVelocity.Y, 0)
 			enemy.AssemblyAngularVelocity = Vector3.zero

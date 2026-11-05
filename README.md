@@ -75,6 +75,7 @@ No other file needs to change (a brand-new modifier type only needs a rule in `M
 | Sprint (hold) | Left Shift | Left stick click | "Correr" button |
 | Use active card | E | X | "Carta" button |
 | Toggle test cards | 1 / 2 / 3 | — | — |
+| Toggle killers aggressive mode | K | — | — |
 
 ## Running it
 

@@ -16,6 +16,9 @@ local HIT_COOLDOWN = 1    -- seconds before the same killer can hit the same pla
 local lastHitTimes = {}
 
 RunService.Heartbeat:Connect(function()
+	-- Idle killers (aggressive mode off, see EnemyChase) don't hurt anyone
+	if workspace:GetAttribute("KillersActive") ~= true then return end
+
 	local now = os.clock()
 
 	for _, killer in KILLER_FOLDER:GetChildren() do
